@@ -105,6 +105,7 @@ async def get_commands(client, token, chat, state):
         body = (message.get('text') or '').strip()
         if body in ('/start', BUTTON_CHECK, BUTTON_STATUS, '/check', '/status') or body.startswith(('/start@', '/check@', '/status@')):
             commands.append(body)
+    print('Telegram: получено обновлений:', len(updates), '; команд из своего чата:', len(commands))
     return offset, commands
 
 
@@ -190,17 +191,21 @@ async def main():
                     '⚠️ Проверить билеты сейчас не удалось. Повторная проверка будет при следующем запуске GitHub Actions.')
             raise
 
-        # A run handles the newest request once, rather than sending duplicate answers.
-        if commands:
-            command = commands[-1]
+        # Reply to every button press; the previous version silently discarded all
+        # but the newest press when several accumulated between scheduled runs.
+        for command in commands[-10:]:
             if command.startswith('/start'):
                 await telegram_send(client, token, chat,
-                    '👋 Мониторинг «Натальной карты» включён.\nНажми «🔎 Проверить билеты», чтобы получить результат на следующем запуске GitHub Actions.\nИнтервал по расписанию — около 5 минут, возможны задержки.\n\n' + result_text)
+                    '👋 Мониторинг «Натальной карты» включён.\n'
+                    'Кнопки работают во время запусков GitHub Actions, не мгновенно.\n\n' + result_text)
             elif command == BUTTON_STATUS or command.startswith('/status'):
                 await telegram_send(client, token, chat,
-                    '✅ Бот работает через GitHub Actions.\nПоследняя проверка:\n\n' + result_text)
+                    '✅ Мониторинг включён.\nПоследняя проверка:\n\n' + result_text)
             else:
                 await telegram_send(client, token, chat, result_text)
+            print('Telegram: отправлен ответ на команду:',
+                  'start' if command.startswith('/start') else
+                  'status' if command in (BUTTON_STATUS, '/status') else 'check')
 
         state['telegram_offset'] = new_offset
         STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
