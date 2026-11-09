@@ -1,4 +1,6 @@
 {
-  "initialized": false,
-  "links": {}
+  "initialized": true,
+  "links": {},
+  "last_checked": "2026-11-09T13:02:40.601678+00:00",
+  "last_event_date": ""
 }
