@@ -1,5 +1,7 @@
 """GitHub Actions ticket monitor with a Telegram reply-keyboard check command."""
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import re
@@ -10,9 +12,11 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from cryptography.fernet import Fernet, InvalidToken
 
 PAGE = 'https://mediumquality.ru/natalnayakarta'
 STATE = Path('state.json')
+SUBSCRIPTIONS = Path('subscribers.enc')
 MONTHS = dict(zip('января февраля марта апреля мая июня июля августа сентября октября ноября декабря'.split(), range(1, 13)))
 MONTH_RE = '|'.join(MONTHS)
 SOLD_OUT = ('нет билетов', 'билетов нет', 'все билеты проданы', 'билеты закончились',
@@ -89,8 +93,32 @@ async def telegram_send(client, token, chat, message):
     })
 
 
-async def get_commands(client, token, chat, state):
-    """Read only messages from the configured chat; remember the last update id."""
+def subscription_cipher(token):
+    # Telegram bot token contains substantial entropy. Never commit the token itself.
+    derived = hashlib.sha256(("natalka-subscriptions-v1:" + token).encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(derived))
+
+
+def read_subscribers(token, owner):
+    if not SUBSCRIPTIONS.exists():
+        return {str(owner)}
+    try:
+        content = subscription_cipher(token).decrypt(SUBSCRIPTIONS.read_bytes())
+        ids = json.loads(content)
+        if not isinstance(ids, list) or not all(str(x).lstrip('-').isdigit() for x in ids):
+            raise ValueError('Invalid subscriptions format')
+        return set(map(str, ids)) | {str(owner)}
+    except (InvalidToken, ValueError) as err:
+        raise RuntimeError('Cannot decrypt subscribers.enc. Do not rotate the bot token without migrating subscribers.') from err
+
+
+def save_subscribers(token, subscribers):
+    payload = json.dumps(sorted(subscribers)).encode()
+    SUBSCRIPTIONS.write_bytes(subscription_cipher(token).encrypt(payload) + b'\n')
+
+
+async def get_commands(client, token, state):
+    """All private chats may subscribe; updates are acked only after successful processing."""
     offset = int(state.get('telegram_offset', 0))
     updates = await telegram_api(client, token, 'getUpdates', {
         'offset': offset, 'timeout': 0, 'limit': 100,
@@ -100,13 +128,29 @@ async def get_commands(client, token, chat, state):
     for update in updates:
         offset = max(offset, int(update['update_id']) + 1)
         message = update.get('message') or {}
-        if str((message.get('chat') or {}).get('id', '')) != chat:
+        chat = message.get('chat') or {}
+        if chat.get('type') != 'private' or not str(chat.get('id', '')).lstrip('-').isdigit():
             continue
         body = (message.get('text') or '').strip()
-        if body in ('/start', BUTTON_CHECK, BUTTON_STATUS, '/check', '/status') or body.startswith(('/start@', '/check@', '/status@')):
-            commands.append(body)
-    print('Telegram: получено обновлений:', len(updates), '; команд из своего чата:', len(commands))
+        name = body.split('@', 1)[0] if body.startswith('/') else body
+        if name in ('/start', '/stop', '/check', '/status', BUTTON_CHECK, BUTTON_STATUS):
+            commands.append((str(chat['id']), name))
+    print('Telegram updates:', len(updates), '; commands:', len(commands))
     return offset, commands
+
+
+async def send_to_subscribers(client, token, subscribers, text):
+    for chat in list(sorted(subscribers)):
+        try:
+            await telegram_send(client, token, chat, text)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in (400, 403):
+                subscribers.discard(chat)
+                print('Subscriber removed: chat unavailable')
+            else:
+                raise
+        await asyncio.sleep(0.05)
 
 
 async def check_ticket(browser, url):
@@ -145,18 +189,27 @@ def render_check_result(event, results, checked_at):
 
 async def main():
     token = os.environ['TELEGRAM_BOT_TOKEN'].strip()
-    chat = os.environ['TELEGRAM_CHAT_ID'].strip()
+    owner = os.environ['TELEGRAM_CHAT_ID'].strip()
+    if not owner.isdigit():
+        raise ValueError('TELEGRAM_CHAT_ID must be a numeric private chat ID')
     state = read_state()
+    subscribers = read_subscribers(token, owner)
     checked_at = datetime.now(timezone.utc)
     async with httpx.AsyncClient(follow_redirects=True, timeout=25, headers={
-            'User-Agent': 'Mozilla/5.0 (compatible; TicketAvailabilityMonitor/1.1)'}) as client:
-        new_offset, commands = await get_commands(client, token, chat, state)
-        # Always check on a scheduled run, then answer any outstanding button presses.
+            'User-Agent': 'Mozilla/5.0 (compatible; TicketAvailabilityMonitor/1.2)'}) as client:
+        new_offset, commands = await get_commands(client, token, state)
+        # Apply subscription changes BEFORE sending notifications.
+        for chat, cmd in commands:
+            if cmd == '/start':
+                subscribers.add(chat)
+            elif cmd == '/stop' and chat != owner:
+                subscribers.discard(chat)
+
         try:
             html_response = await client.get(PAGE)
             html_response.raise_for_status()
             event, links = parse_announcement(html_response.text, checked_at.date())
-            print('Дата мероприятия:', event or 'нет будущей даты', '; ссылок:', len(links))
+            print('Дата мероприятия:', event or 'нет будущей даты', '; ссылок:', len(links), '; подписчиков:', len(subscribers))
             known = state.setdefault('links', {})
             results = []
             if event and links:
@@ -170,11 +223,11 @@ async def main():
                             results.append((url, label, status))
                             print('Билет:', label, 'статус:', status)
                             if not previous:
-                                await telegram_send(client, token, chat,
+                                await send_to_subscribers(client, token, subscribers,
                                     f'🎟 Новая ссылка на «Натальную карту»!\n📅 {event:%d.%m.%Y}\n🎤 {label}\n{url}\n\nПроверь наличие билетов. Статус: ' +
                                     ('похоже, покупка доступна' if status == 'available' else 'не подтверждён'))
                             elif previous_status == 'soldout' and status == 'available':
-                                await telegram_send(client, token, chat,
+                                await send_to_subscribers(client, token, subscribers,
                                     f'🚨 Возможно, билеты ВЕРНУЛИСЬ!\n📅 {event:%d.%m.%Y}\n🎤 {label}\n{url}\n\nПроверь и покупай быстро!')
                             known[url] = {'label': label, 'date': event.isoformat(),
                                           'status': status if status != 'unknown' else previous_status}
@@ -184,32 +237,39 @@ async def main():
             state['last_checked'] = checked_at.isoformat()
             state['last_event_date'] = event.isoformat() if event else ''
             result_text = render_check_result(event, results, checked_at)
+            site_error = False
         except Exception as exc:
             print('Ошибка проверки сайта:', type(exc).__name__, str(exc)[:300])
-            if any(c in ('/check', BUTTON_CHECK) or c.startswith('/check@') for c in commands):
-                await telegram_send(client, token, chat,
-                    '⚠️ Проверить билеты сейчас не удалось. Повторная проверка будет при следующем запуске GitHub Actions.')
-            raise
+            site_error = True
+            result_text = '⚠️ Не удалось проверить сайт. Повторная попытка при следующем запуске GitHub Actions.'
 
-        # Reply to every button press; the previous version silently discarded all
-        # but the newest press when several accumulated between scheduled runs.
-        for command in commands[-10:]:
-            if command.startswith('/start'):
-                await telegram_send(client, token, chat,
-                    '👋 Мониторинг «Натальной карты» включён.\n'
-                    'Кнопки работают во время запусков GitHub Actions, не мгновенно.\n\n' + result_text)
-            elif command == BUTTON_STATUS or command.startswith('/status'):
-                await telegram_send(client, token, chat,
-                    '✅ Мониторинг включён.\nПоследняя проверка:\n\n' + result_text)
+        for chat, command in commands:
+            if command == '/start':
+                response = ('👋 Ты подписан на «Натальную карту»!\n'
+                            'Когда появятся новые даты или признаки доступных билетов, пришлю ссылку.\n'
+                            'Кнопки обрабатываются при запуске GitHub Actions, не мгновенно.\n\n' + result_text)
+            elif command == '/stop':
+                response = ('ℹ️ Главный чат всегда остаётся подписанным.' if chat == owner
+                            else '🔕 Подписка отключена. Чтобы включить снова, отправь /start.')
+            elif command == BUTTON_STATUS or command == '/status':
+                response = ('✅ Ты подписан.\n' if chat in subscribers else '🔕 Ты не подписан. Нажми /start.\n') + result_text
             else:
-                await telegram_send(client, token, chat, result_text)
-            print('Telegram: отправлен ответ на команду:',
-                  'start' if command.startswith('/start') else
-                  'status' if command in (BUTTON_STATUS, '/status') else 'check')
-
+                response = result_text
+            try:
+                await telegram_send(client, token, chat, response)
+                print('Telegram command handled:', command)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (400, 403):
+                    subscribers.discard(chat)
+                    print('Cannot send reply, removed unavailable chat')
+                else:
+                    raise
         state['telegram_offset'] = new_offset
+        save_subscribers(token, subscribers)
         STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-        print('Проверка завершена; обработано команд:', len(commands))
+        print('Готово; команд:', len(commands), '; подписчиков:', len(subscribers))
+        if site_error:
+            raise RuntimeError('Site check failed; see logs')
 
 
 if __name__ == '__main__':

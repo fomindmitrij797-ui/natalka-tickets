@@ -1,7 +1,4 @@
 {
-  "initialized": true,
-  "links": {},
-  "last_checked": "2026-11-09T13:18:09.693499+00:00",
-  "last_event_date": "",
-  "telegram_offset": 18775142
+  "initialized": false,
+  "links": {}
 }
